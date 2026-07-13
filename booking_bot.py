@@ -12,6 +12,14 @@ loses the whole batch, this books each date independently:
 
 "Leave site?" browser popups (pic3) are auto-accepted. A per-date summary
 prints at the end.
+
+Usage:
+    python booking_bot.py                 # default room (see ROOM_TO_BOOK)
+    python booking_bot.py LL1-20          # pick the room
+    python booking_bot.py LL2-07 --sections 2 --max-days 7
+    python booking_bot.py --help          # all options
+
+The constants below are the defaults; command-line arguments override them.
 """
 import argparse
 import os
@@ -23,9 +31,9 @@ from playwright.sync_api import sync_playwright
 URL = "https://nyu.libcal.com/r/new"
 CRED_FILE = "credential.txt"
 
-ROOM_TO_BOOK = "LL2-07"   # "LL1-20" or "LL2-07"
+ROOM_TO_BOOK = "LL2-07"   # default room, e.g. "LL1-20" or "LL2-07" (CLI overrides)
 SECTIONS = 3              # clicks/day: up to 3 * 4 cells = 12 cells = 3 hrs
-MAX_DAYS = 20            # safety cap (window is ~14 days)
+MAX_DAYS = 20             # safety cap (window is ~14 days)
 DUO_WAIT_SECONDS = 60    # Duo push times out ~60s
 CONFIRM_DIR = "confirmations"
 
