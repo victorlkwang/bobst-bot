@@ -1,0 +1,8 @@
+# Browser automation (booking_bot.py, parallel_bot.py, capture_requests.py)
+playwright>=1.40
+
+# Direct HTTP client (http_booking.py)
+httpx>=0.27
+
+# After installing, download the browser once:
+#   playwright install chromium

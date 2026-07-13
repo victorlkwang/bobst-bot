@@ -1,0 +1,26 @@
+# --- secrets & session data (NEVER commit these) ---
+# credential.txt: NetID + password, one line each
+credential.txt
+# state.json / state-*.json: saved login cookies from capture_requests.py
+state.json
+state-*.json
+
+# --- run output ---
+# captures/: recorded API traffic (may contain query params)
+captures/
+# confirmations/: booking confirmation screenshots
+confirmations/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- os / editor cruft ---
+.DS_Store
+*.swp
+.idea/
+.vscode/
