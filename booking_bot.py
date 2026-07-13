@@ -12,7 +12,16 @@ loses the whole batch, this books each date independently:
 
 "Leave site?" browser popups (pic3) are auto-accepted. A per-date summary
 prints at the end.
+
+Usage:
+    python booking_bot.py                 # default room (see ROOM_TO_BOOK)
+    python booking_bot.py LL1-20          # pick the room
+    python booking_bot.py LL2-07 --sections 2 --max-days 7
+    python booking_bot.py --help          # all options
+
+The constants below are the defaults; command-line arguments override them.
 """
+import argparse
 import os
 import re
 import time
@@ -22,9 +31,9 @@ from playwright.sync_api import sync_playwright
 URL = "https://nyu.libcal.com/r/new"
 CRED_FILE = "credential.txt"
 
-ROOM_TO_BOOK = "LL2-07"   # "LL1-20" or "LL2-07"
+ROOM_TO_BOOK = "LL2-07"   # default room, e.g. "LL1-20" or "LL2-07" (CLI overrides)
 SECTIONS = 3              # clicks/day: up to 3 * 4 cells = 12 cells = 3 hrs
-MAX_DAYS = 20            # safety cap (window is ~14 days)
+MAX_DAYS = 20             # safety cap (window is ~14 days)
 DUO_WAIT_SECONDS = 60    # Duo push times out ~60s
 CONFIRM_DIR = "confirmations"
 
@@ -452,7 +461,8 @@ def save_confirmation(page, room, date_iso):
 
 
 # ---------- per-credential (per-day) run ----------
-def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK):
+def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
+                       sections=SECTIONS, max_days=MAX_DAYS):
     page.on("dialog", lambda d: d.accept())  # auto-accept "Leave site?" (pic3)
 
     result = {"idx": idx, "netid": netid, "name": name, "room": room,
@@ -461,7 +471,7 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK):
 
     first_login_done = False
     offset = 0
-    while offset < MAX_DAYS:
+    while offset < max_days:
         ensure_search_form(page)
         show_availability(page)
         advance_to_offset(page, offset)
@@ -472,7 +482,7 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK):
             break
 
         date_human, date_iso = read_current_date(page)
-        booked = book_sections_for_day(page, room)
+        booked = book_sections_for_day(page, room, sections)
 
         if booked == 0:
             log(f"{date_human}: no available slot")
@@ -524,7 +534,8 @@ def click_begin_booking_request(page):
 
 
 # ---------- runner ----------
-def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BOOK):
+def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BOOK,
+                       sections=SECTIONS, max_days=MAX_DAYS, headless=False):
     global _LOG_TAG
     _LOG_TAG = f"[{name}] "
     print(f"\n===== {name}: booking {room} for {netid}, one day at a time =====", flush=True)
@@ -532,11 +543,12 @@ def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BO
     result = {"idx": idx, "netid": netid, "name": name, "room": room,
               "days": [], "login_failed": False}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=150)
+        browser = p.chromium.launch(headless=headless, slow_mo=150)
         context = browser.new_context(viewport={"width": 1400, "height": 900})
         page = context.new_page()
         try:
-            result = run_for_credential(page, netid, password, name, idx, room)
+            result = run_for_credential(page, netid, password, name, idx, room,
+                                        sections, max_days)
         except Exception as e:
             log(f"ERROR: {e}")
             result["error"] = str(e)
@@ -561,12 +573,30 @@ def print_summary(results):
             print("(no dates processed)", flush=True)
 
 
-def main():
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Book a Bobst group study room, one day at a time.")
+    p.add_argument("room", nargs="?", default=ROOM_TO_BOOK,
+                   help=f"room number, e.g. LL2-07 or LL1-20 (default: {ROOM_TO_BOOK})")
+    p.add_argument("--sections", type=int, default=SECTIONS,
+                   help=f"click groups per day; each is ~1 hr (default: {SECTIONS})")
+    p.add_argument("--max-days", type=int, default=MAX_DAYS,
+                   help=f"safety cap on days to walk (default: {MAX_DAYS})")
+    p.add_argument("--headless", action="store_true",
+                   help="run without a visible browser window "
+                        "(only works with a saved session; Duo needs a window)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     creds = load_credentials(CRED_FILE)
     if not creds:
         print("No credentials found in credential.txt")
         return
-    results = [run_one_credential(netid, password, name, i, len(creds))
+    results = [run_one_credential(netid, password, name, i, len(creds),
+                                  room=args.room, sections=args.sections,
+                                  max_days=args.max_days, headless=args.headless)
                for i, (netid, password, name) in enumerate(creds, start=1)]
     print_summary(results)
 

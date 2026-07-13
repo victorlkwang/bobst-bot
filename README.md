@@ -35,13 +35,27 @@ git-ignored so your password and cookies never get committed.
 ### Browser bot (works out of the box)
 
 ```bash
-python booking_bot.py            # single credential
-python parallel_bot.py           # all credentials in credential.txt
+python booking_bot.py                 # single credential, default room
+python booking_bot.py LL1-20          # pick the room on the command line
+python parallel_bot.py LL2-07         # all credentials in credential.txt, one room
+
+python booking_bot.py --help          # all options
 ```
 
-Edit the config constants at the top of `booking_bot.py` (`ROOM_TO_BOOK`,
-`SECTIONS`, `MAX_DAYS`) to taste. A browser window opens; watch your phone for
-the Duo push and approve it. Confirmation screenshots land in `confirmations/`.
+The room is a positional argument, so `python booking_bot.py <room-number>` is
+all you need for the common case. Extra flags tune the run without editing code:
+
+| Flag | booking_bot | parallel_bot | Meaning |
+| --- | :---: | :---: | --- |
+| `<room>` | ✓ | ✓ | room number, e.g. `LL2-07` (positional; defaults to `LL2-07`) |
+| `--sections N` | ✓ | ✓ | click groups per day, ~1 hr each (default 3) |
+| `--max-days N` | ✓ | ✓ | safety cap on days to walk (default 20) |
+| `--headless` | ✓ | | no visible window (only with a saved session; Duo needs a window) |
+| `--max-concurrent N` | | ✓ | simultaneous browsers (default 4) |
+| `--stagger N` | | ✓ | seconds between first-batch launches (default 10) |
+
+A browser window opens; watch your phone for the Duo push and approve it.
+Confirmation screenshots land in `confirmations/`.
 
 ### The faster HTTP path (opt-in, needs a one-time capture)
 
