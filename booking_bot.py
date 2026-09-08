@@ -462,69 +462,77 @@ def save_confirmation(page, room, date_iso):
 
 # ---------- per-credential (per-day) run ----------
 def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
-                       sections=SECTIONS, max_days=MAX_DAYS):
+                       sections=SECTIONS, max_days=MAX_DAYS, result=None):
     page.on("dialog", lambda d: d.accept())  # auto-accept "Leave site?" (pic3)
 
-    result = {"idx": idx, "netid": netid, "name": name, "room": room,
-              "days": [], "login_failed": False}
+    # result is filled in place so partial progress survives even if a later
+    # day raises (e.g. Playwright "execution context destroyed" mid-navigation).
+    if result is None:
+        result = {"idx": idx, "netid": netid, "name": name, "room": room,
+                  "days": [], "login_failed": False}
     page.goto(URL, wait_until="domcontentloaded")
 
     first_login_done = False
     offset = 0
     while offset < max_days:
-        ensure_search_form(page)
-        show_availability(page)
-        advance_to_offset(page, offset)
-        page.wait_for_timeout(1000)  # extra load buffer for green cells
+        try:
+            ensure_search_form(page)
+            show_availability(page)
+            advance_to_offset(page, offset)
+            page.wait_for_timeout(1000)  # extra load buffer for green cells
 
-        if end_notice_visible(page):
-            log("reached end of bookable window")
-            break
-
-        date_human, date_iso = read_current_date(page)
-        booked = book_sections_for_day(page, room, sections)
-
-        if booked == 0:
-            log(f"{date_human}: no available slot")
-            result["days"].append((date_human, "no available slot"))
-            offset += 1
-            continue
-
-        if not click_begin_booking_request(page):
-            log(f"{date_human}: could not start booking")
-            result["days"].append((date_human, "error (no Begin button)"))
-            offset += 1
-            continue
-
-        if not first_login_done:
-            status = login(page, netid, password)
-            if status in ("ok", "no_login_page"):
-                first_login_done = True
-            else:
-                log(f"{date_human}: login failed ({status})")
-                result["days"].append((date_human, f"login failed ({status})"))
-                result["login_failed"] = True
+            if end_notice_visible(page):
+                log("reached end of bookable window")
                 break
 
-        if not advance_to_submit(page):
-            log(f"{date_human}: booking details not reached")
-            result["days"].append((date_human, "error (no Submit)"))
+            date_human, date_iso = read_current_date(page)
+            booked = book_sections_for_day(page, room, sections)
+
+            if booked == 0:
+                log(f"{date_human}: no available slot")
+                result["days"].append((date_human, "no available slot"))
+                continue
+
+            if not click_begin_booking_request(page):
+                log(f"{date_human}: could not start booking")
+                result["days"].append((date_human, "error (no Begin button)"))
+                continue
+
+            if not first_login_done:
+                status = login(page, netid, password)
+                if status in ("ok", "no_login_page"):
+                    first_login_done = True
+                else:
+                    log(f"{date_human}: login failed ({status})")
+                    result["days"].append((date_human, f"login failed ({status})"))
+                    result["login_failed"] = True
+                    break
+
+            if not advance_to_submit(page):
+                log(f"{date_human}: booking details not reached")
+                result["days"].append((date_human, "error (no Submit)"))
+                continue
+
+            outcome, errtext = submit_and_classify(page)
+            if outcome == "confirmed":
+                save_confirmation(page, room, date_iso)
+                log(f"{date_human}: booked")
+                result["days"].append((date_human, "booked"))
+                click_named_wait(page, "Make Another Booking", timeout=8000)
+            else:
+                log(f"{date_human}: error -- {errtext}")
+                result["days"].append((date_human, f"error: {errtext}"))
+                click_named_wait(page, "Remove", timeout=8000)
+
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            # One bad day (usually a mid-navigation race) shouldn't abort the
+            # whole window or discard already-booked days. Log it, record it,
+            # and move on to the next date.
+            log(f"day offset {offset}: recovered from error -- {e}")
+            result["days"].append((f"offset {offset}", f"error: {e}"))
+        finally:
             offset += 1
-            continue
-
-        outcome, errtext = submit_and_classify(page)
-        if outcome == "confirmed":
-            save_confirmation(page, room, date_iso)
-            log(f"{date_human}: booked")
-            result["days"].append((date_human, "booked"))
-            click_named_wait(page, "Make Another Booking", timeout=8000)
-        else:
-            log(f"{date_human}: error -- {errtext}")
-            result["days"].append((date_human, f"error: {errtext}"))
-            click_named_wait(page, "Remove", timeout=8000)
-
-        page.wait_for_timeout(1500)
-        offset += 1
 
     return result
 
@@ -547,8 +555,10 @@ def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BO
         context = browser.new_context(viewport={"width": 1400, "height": 900})
         page = context.new_page()
         try:
-            result = run_for_credential(page, netid, password, name, idx, room,
-                                        sections, max_days)
+            # Pass result in so run_for_credential fills it in place; any days
+            # already recorded are kept even if it raises before returning.
+            run_for_credential(page, netid, password, name, idx, room,
+                               sections, max_days, result=result)
         except Exception as e:
             log(f"ERROR: {e}")
             result["error"] = str(e)
