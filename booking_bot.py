@@ -81,6 +81,29 @@ def load_credentials(path):
     return creds
 
 
+# ---------- navigation-safe probing ----------
+def settle(page, timeout=15000):
+    """Wait for an in-flight navigation to finish.
+
+    "Begin Booking Request" and "Submit my Booking" both navigate, and any
+    locator call made while that is in flight dies with "Execution context was
+    destroyed". Settling first is what makes the probes below safe.
+    """
+    for state in ("domcontentloaded", "load"):
+        try:
+            page.wait_for_load_state(state, timeout=timeout)
+        except Exception:
+            pass
+
+
+def count_safe(locator):
+    """locator.count() that reports 0 instead of raising mid-navigation."""
+    try:
+        return locator.count()
+    except Exception:
+        return 0
+
+
 # ---------- locators ----------
 def get_scroller(page):
     return page.locator(".fc-scroller").filter(
@@ -110,10 +133,10 @@ def resolve_room_row(page, room):
     if info.get("rid") is not None:
         rid = info["rid"]
         loc = page.locator(f'.fc-timeline-lane.fc-resource[data-resource-id="{rid}"]')
-        if loc.count() > 0:
+        if count_safe(loc) > 0:
             return loc.first
         loc = page.locator(f'.fc-timeline-body [data-resource-id="{rid}"]')
-        if loc.count() > 0:
+        if count_safe(loc) > 0:
             return loc.first
     if info.get("index") is not None:
         return page.locator(".fc-timeline-lane.fc-resource").nth(info["index"])
@@ -415,15 +438,25 @@ def login(page, netid, password):
 
 
 # ---------- submit / classify ----------
-def advance_to_submit(page):
-    for _ in range(3):
-        if page.get_by_role("button", name="Submit my Booking").count() > 0:
+def advance_to_submit(page, timeout=30000):
+    """Get from the cart to the page carrying "Submit my Booking".
+
+    Clicking "Begin Booking Request" navigates, so probing immediately (as this
+    used to) raised "Execution context was destroyed" and the whole day was
+    abandoned with its slots still selected on screen. Settle for the
+    navigation, then poll -- clicking any intermediate "Continue" -- until
+    Submit shows up or we run out of time.
+    """
+    deadline = time.time() + timeout / 1000.0
+    while time.time() < deadline:
+        settle(page)
+        if count_safe(page.get_by_role("button", name="Submit my Booking")) > 0:
             return True
-        if click_named_wait(page, "Continue", timeout=4000):
+        if click_named_wait(page, "Continue", timeout=3000):
             page.wait_for_timeout(1500)
             continue
-        break
-    return page.get_by_role("button", name="Submit my Booking").count() > 0
+        page.wait_for_timeout(500)
+    return count_safe(page.get_by_role("button", name="Submit my Booking")) > 0
 
 
 def find_error_text(page):
@@ -445,17 +478,35 @@ def find_error_text(page):
 
 def submit_and_classify(page):
     click_named_wait(page, "Submit my Booking", timeout=8000)
+    settle(page)  # the submit navigates; probing before it lands raises
     deadline = time.time() + 20
     while time.time() < deadline:
-        if page.get_by_text("Booking Confirmed", exact=False).count() > 0:
+        if count_safe(page.get_by_text("Booking Confirmed", exact=False)) > 0:
             return "confirmed", None
         err = find_error_text(page)
         if err:
             return "error", err
         page.wait_for_timeout(500)
-    if page.get_by_text("Booking Confirmed", exact=False).count() > 0:
+    if count_safe(page.get_by_text("Booking Confirmed", exact=False)) > 0:
         return "confirmed", None
     return "error", find_error_text(page) or "unknown error"
+
+
+def clear_cart(page, max_items=16):
+    """Empty the cart after a rejected request.
+
+    The error page shows one "Remove" per selected slot. Clicking it once left
+    the rest in the cart, and those leftovers were carried into the next day's
+    request -- pushing it over the 180-minute limit as well.
+    """
+    removed = 0
+    while removed < max_items and click_named_wait(page, "Remove", timeout=3000):
+        removed += 1
+        page.wait_for_timeout(600)
+        settle(page)
+    if removed:
+        log(f"  cleared {removed} slot(s) from the cart")
+    return removed
 
 
 def read_booked_time(page):
@@ -560,7 +611,7 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
             else:
                 log(f"{date_human}: error -- {errtext}")
                 result["days"].append((date_human, f"error: {errtext}"))
-                click_named_wait(page, "Remove", timeout=8000)
+                clear_cart(page)
 
             page.wait_for_timeout(1500)
         except Exception as e:
@@ -576,7 +627,11 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
 
 
 def click_begin_booking_request(page):
-    return click_named_wait(page, "Begin Booking Request", timeout=15000)
+    if not click_named_wait(page, "Begin Booking Request", timeout=15000):
+        return False
+    settle(page)
+    page.wait_for_timeout(1200)
+    return True
 
 
 # ---------- runner ----------
