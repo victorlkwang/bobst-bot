@@ -326,28 +326,59 @@ def login_error_visible(page):
     return False
 
 
+def fill_and_verify(page, selector, value, attempts=4):
+    """Fill an input and confirm the value actually stuck.
+
+    Microsoft's login swaps the email/password field in via JS mid-transition,
+    so a fill() can land on a node that gets replaced a moment later, silently
+    dropping the value (this is why the password sometimes never gets entered).
+    Re-locate and refill until input_value() matches, or we run out of tries.
+    """
+    for _ in range(attempts):
+        field = page.locator(selector).first
+        try:
+            field.wait_for(state="visible", timeout=8000)
+            field.scroll_into_view_if_needed()
+            field.click()
+            field.fill("")
+            field.fill(value)
+            page.wait_for_timeout(200)
+            if field.input_value() == value:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+    return False
+
+
+PW_SEL = "input[type=password], input[name=passwd]"
+EMAIL_SEL = "input[type=email], input[name=loginfmt]"
+
+
 def login(page, netid, password):
     """Returns 'ok', 'no_login_page', 'bad_credentials', 'duo_no_prompt', 'duo_timeout'."""
-    email = page.locator("input[type=email], input[name=loginfmt]").first
+    email = page.locator(EMAIL_SEL).first
     try:
         email.wait_for(timeout=10000)
     except Exception:
         return "no_login_page"
 
     log("  entering NetID / password...")
-    email.fill(netid)
+    fill_and_verify(page, EMAIL_SEL, netid)
     if not click_named_wait(page, "Next", timeout=8000):
-        email.press("Enter")
+        page.locator(EMAIL_SEL).first.press("Enter")
 
     try:
-        pw_field = page.locator("input[type=password], input[name=passwd]").first
-        pw_field.wait_for(timeout=15000)
+        pw_field = page.locator(PW_SEL).first
+        pw_field.wait_for(state="visible", timeout=15000)
     except Exception:
         return "bad_credentials" if login_error_visible(page) else "duo_no_prompt"
 
-    pw_field.fill(password)
+    if not fill_and_verify(page, PW_SEL, password):
+        log("  WARNING: password field would not accept input after retries")
+
     if not click_named_wait(page, "Sign in", timeout=10000):
-        pw_field.press("Enter")
+        page.locator(PW_SEL).first.press("Enter")
 
     deadline = time.time() + 25
     duo_clicked = False
@@ -476,6 +507,13 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
     offset = 0
     while offset < max_days:
         try:
+            # Start every day from a freshly loaded search page. After
+            # "Make Another Booking"/"Remove" the previous day leaves residual
+            # cart and filter state behind, and ensure_search_form only reloads
+            # when it can't find the button -- so day 2+ would re-search that
+            # dirty state and come back empty. Cookies keep us logged in, so a
+            # reload costs nothing but guarantees a clean slate.
+            page.goto(URL, wait_until="domcontentloaded")
             ensure_search_form(page)
             show_availability(page)
             advance_to_offset(page, offset)
