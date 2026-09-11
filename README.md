@@ -15,10 +15,24 @@ own internal endpoints directly.
 ```bash
 pip install -r requirements.txt
 playwright install chromium          # one-time browser download
-
-cp credential.txt.example credential.txt
-# edit credential.txt with your NetID + password
 ```
+
+Then create `credential.txt` in the repo root — one credential per line, fields
+separated by spaces:
+
+```
+NetID  password  Display Name
+```
+
+For example:
+
+```
+abc1234 your-password-here Alice Example
+```
+
+- NetID works with or without `@nyu.edu`.
+- Display Name is optional; it only labels console and summary output.
+- Lines starting with `#` are ignored.
 
 `credential.txt`, `state.json`, `captures/`, and `confirmations/` are all
 git-ignored so your password and cookies never get committed.
