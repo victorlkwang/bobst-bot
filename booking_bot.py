@@ -544,7 +544,8 @@ def save_confirmation(page, room, date_iso):
 
 # ---------- per-credential (per-day) run ----------
 def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
-                       sections=SECTIONS, max_days=MAX_DAYS, result=None):
+                       sections=SECTIONS, max_days=MAX_DAYS, result=None,
+                       on_login_done=None):
     page.on("dialog", lambda d: d.accept())  # auto-accept "Leave site?" (pic3)
 
     # result is filled in place so partial progress survives even if a later
@@ -589,6 +590,12 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
 
             if not first_login_done:
                 status = login(page, netid, password)
+                # Duo has resolved one way or the other. A driver running
+                # several credentials (parallel_bot) uses this to know the
+                # phone is free, so the next credential can push while this
+                # one gets on with booking.
+                if on_login_done:
+                    on_login_done(status)
                 if status in ("ok", "no_login_page"):
                     first_login_done = True
                 else:
@@ -636,13 +643,29 @@ def click_begin_booking_request(page):
 
 # ---------- runner ----------
 def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BOOK,
-                       sections=SECTIONS, max_days=MAX_DAYS, headless=False):
+                       sections=SECTIONS, max_days=MAX_DAYS, headless=False,
+                       on_login_done=None):
     global _LOG_TAG
     _LOG_TAG = f"[{name}] "
     print(f"\n===== {name}: booking {room} for {netid}, one day at a time =====", flush=True)
 
     result = {"idx": idx, "netid": netid, "name": name, "room": room,
               "days": [], "login_failed": False}
+    # Fire on_login_done at most once, and never let a caller's callback break
+    # the run. The finally below is the backstop: a run that never reaches the
+    # login (no free slots on any day, browser died early) must still report,
+    # or a driver waiting on this credential would wait forever.
+    fired = {"done": False}
+
+    def fire_login_done(status):
+        if fired["done"] or on_login_done is None:
+            return
+        fired["done"] = True
+        try:
+            on_login_done(status)
+        except Exception as e:
+            log(f"  on_login_done callback failed: {e}")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=150)
         context = browser.new_context(viewport={"width": 1400, "height": 900})
@@ -651,11 +674,13 @@ def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BO
             # Pass result in so run_for_credential fills it in place; any days
             # already recorded are kept even if it raises before returning.
             run_for_credential(page, netid, password, name, idx, room,
-                               sections, max_days, result=result)
+                               sections, max_days, result=result,
+                               on_login_done=fire_login_done)
         except Exception as e:
             log(f"ERROR: {e}")
             result["error"] = str(e)
         finally:
+            fire_login_done("run ended without logging in")
             page.wait_for_timeout(1500)
             browser.close()
             log("browser closed.")
