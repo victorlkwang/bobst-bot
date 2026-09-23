@@ -4,11 +4,16 @@ Bobst room booking bot -- ONE DAY AT A TIME (single credential).
 Because booking all 14 days in one cart trips the "180 min per day" limit and
 loses the whole batch, this books each date independently:
 
-  search availability -> go to the date -> book the room's green cells ->
+  search availability -> Go To Date (pic2) -> book the room's green cells ->
   Begin Booking Request -> (login once, Duo) -> Submit my Booking
     * confirmed (pic1): screenshot -> confirmations/<room>/<date>/  -> Make Another Booking
     * error e.g. "exceeds 180 min" (pic5): click Remove
   ... repeat for the next date until the 14-day window ends.
+
+Each date is reached by opening "Go To Date" and clicking the day in its
+calendar, so day 14 costs the same two clicks as day 2 (it used to take one
+next-arrow click per day, every day). If that calendar can't be used, it falls
+back to the arrows.
 
 "Leave site?" browser popups (pic3) are auto-accepted. A per-date summary
 prints at the end.
@@ -25,7 +30,8 @@ import argparse
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 URL = "https://nyu.libcal.com/r/new"
@@ -318,17 +324,252 @@ def show_availability(page):
     page.wait_for_timeout(1500)
 
 
+def wait_for_grid(page):
+    """After changing day, wait for the room rows (or LibCal's end-of-window
+    notice) to render, then give the availability a moment to land."""
+    page.wait_for_function(
+        """() => document.querySelector('.fc-timeline-lane.fc-resource')
+              || document.body.innerText.includes('reached the end of the bookable window')""",
+        timeout=15000,
+    )
+    page.wait_for_timeout(900)
+
+
 def advance_to_offset(page, offset):
+    """Blind stepping: only used when the toolbar date can't be read."""
     for _ in range(offset):
         if end_notice_visible(page):
             return
         page.locator("button.fc-next-button").click()
-        page.wait_for_function(
-            """() => document.querySelector('.fc-timeline-lane.fc-resource')
-                  || document.body.innerText.includes('reached the end of the bookable window')""",
-            timeout=15000,
-        )
-        page.wait_for_timeout(900)
+        wait_for_grid(page)
+
+
+def shown_date(page):
+    """The date in the toolbar title (pic2) as a date, or None if unreadable."""
+    try:
+        return datetime.strptime(read_current_date(page)[1], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _day(d):
+    return f"{d:%a %b} {d.day}"
+
+
+def wait_for_shown_date(page, target, timeout=6000):
+    deadline = time.time() + timeout / 1000.0
+    while time.time() < deadline:
+        if shown_date(page) == target:
+            return True
+        page.wait_for_timeout(200)
+    return shown_date(page) == target
+
+
+# ---------- Go To Date ----------
+# The popup that "Go To Date" opens is expected to be bootstrap-datepicker,
+# whose day cells carry data-date = UTC-midnight ms. The other conventions
+# (jQuery UI, flatpickr, Pikaday, a plain date <input>, or failing all of
+# those, the "September 2026" header plus the day number) are there in case
+# LibCal ever swaps the widget. The chosen element is tagged data-bobst-pick
+# so Playwright can give it a real mouse click.
+PICK = "[data-bobst-pick]"
+
+_PICK_PRELUDE = r"""
+  for (const el of document.querySelectorAll('[data-bobst-pick]')) el.removeAttribute('data-bobst-pick');
+  const shown = el => {
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0'
+        && r.width > 0 && r.height > 0;
+  };
+  // Never the timeline itself: its slots carry data-date attributes too.
+  const usable = el => !el.closest('.fc-view-harness') && shown(el);
+  const ROOTS = '.datepicker-dropdown, .ui-datepicker, .flatpickr-calendar.open, .pika-single, [role="dialog"]';
+  const roots = [...document.querySelectorAll(ROOTS)].filter(usable);
+"""
+
+# Returns "found" / "input" (tagged a day cell / a date input), "disabled"
+# (the day is greyed out, e.g. past the bookable window), "elsewhere" (a
+# calendar is open on another month), or "none" (no calendar open).
+FIND_DAY_JS = "([y, m, d]) => {" + _PICK_PRELUDE + r"""
+  const disabled = el => {
+    for (let n = el; n && n !== document.body; n = n.parentElement) {
+      if (n.matches('[disabled], [aria-disabled="true"], .disabled, .ui-state-disabled, '
+                    + '.ui-datepicker-unselectable, .flatpickr-disabled, .is-disabled')) return true;
+      if (n.matches('td, [role="gridcell"]')) break;
+    }
+    return false;
+  };
+  const pad = n => String(n).padStart(2, '0');
+  const iso = `${y}-${pad(m)}-${pad(d)}`;
+  const stamps = [String(Date.UTC(y, m - 1, d)), String(new Date(y, m - 1, d).getTime()), iso];
+  const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+                  'August', 'September', 'October', 'November', 'December'];
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+
+  let hits = [];
+  for (const el of document.querySelectorAll('[data-date]'))
+    if (stamps.includes(el.getAttribute('data-date'))) hits.push(el);
+  hits.push(...document.querySelectorAll(
+    `[data-pika-year="${y}"][data-pika-month="${m - 1}"][data-pika-day="${d}"]`));
+  for (const td of document.querySelectorAll(`td[data-year="${y}"][data-month="${m - 1}"]`))
+    if (norm(td.textContent) === String(d)) hits.push(td.querySelector('a') || td);
+  const label = `${MONTHS[m - 1]} ${d}, ${y}`;
+  for (const el of document.querySelectorAll('[aria-label]'))
+    if (norm(el.getAttribute('aria-label')).includes(label)) hits.push(el);
+  hits = hits.filter(usable);
+
+  if (!hits.length) {
+    for (const root of roots) {
+      if (!norm(root.textContent).includes(`${MONTHS[m - 1]} ${y}`)) continue;
+      const cells = [...root.querySelectorAll('td, button, a, span, div')].filter(el =>
+        el.children.length === 0 && norm(el.textContent) === String(d) && usable(el)
+        && !/\b(old|new|other-month|outside|prevMonthDay|nextMonthDay)\b/.test(
+             el.className + ' ' + (el.parentElement ? el.parentElement.className : '')));
+      if (cells.length === 1) hits.push(cells[0]);
+    }
+  }
+  const open = hits.find(el => !disabled(el));
+  if (open) { open.setAttribute('data-bobst-pick', '1'); return 'found'; }
+  if (hits.length) return 'disabled';
+  const input = [...document.querySelectorAll('input[type="date"]')].find(usable);
+  if (input) { input.setAttribute('data-bobst-pick', '1'); return 'input'; }
+  return roots.length ? 'elsewhere' : 'none';
+}"""
+
+NEXT_MONTH_JS = "() => {" + _PICK_PRELUDE + r"""
+  const SEL = '.datepicker-days th.next, .ui-datepicker-next, .flatpickr-next-month, .pika-next, '
+            + '[aria-label*="next month" i], [title*="next month" i]';
+  const btn = [...document.querySelectorAll(SEL)].find(el => usable(el)
+    && !el.matches('.disabled, .ui-state-disabled, .flatpickr-disabled, .is-disabled, [disabled]'));
+  if (!btn) return false;
+  btn.setAttribute('data-bobst-pick', '1');
+  return true;
+}"""
+
+PICKER_OPEN_JS = "() => {" + _PICK_PRELUDE + "  return roots.length > 0;\n}"
+
+_picker_misses = 0  # Go To Date opened nothing we recognise; after 2, stop trying
+
+
+def open_go_to_date(page):
+    for loc in (page.locator("button.fc-goToDate-button"),
+                page.get_by_role("button", name="Go To Date")):
+        try:
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def find_day(page, target, timeout=2500):
+    """Run FIND_DAY_JS, polling briefly while the popup renders/animates in."""
+    deadline = time.time() + timeout / 1000.0
+    while True:
+        try:
+            status = page.evaluate(FIND_DAY_JS, [target.year, target.month, target.day])
+        except Exception:
+            status = "none"
+        if status != "none" or time.time() >= deadline:
+            return status
+        page.wait_for_timeout(200)
+
+
+def click_tagged(page):
+    el = page.locator(PICK).first
+    try:
+        el.click(timeout=3000)
+    except Exception:
+        # Something (a sticky header, a banner) sits over the popup and
+        # swallows real clicks: fire the events on the element itself.
+        for event in ("mousedown", "mouseup", "click"):
+            el.dispatch_event(event)
+
+
+def close_picker(page):
+    """Dismiss the popup if picking didn't already, so it can't sit over the
+    buttons clicked later. An outside mousedown/click closes every widget
+    FIND_DAY_JS knows; Escape is the backup."""
+    try:
+        if not page.evaluate(PICKER_OPEN_JS):
+            return
+        page.evaluate("""() => ['mousedown', 'mouseup', 'click'].forEach(t =>
+            document.body.dispatchEvent(new MouseEvent(t, {bubbles: true})))""")
+        if page.evaluate(PICKER_OPEN_JS):
+            page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def pick_date(page, target):
+    """Open Go To Date and click `target` in its calendar. Returns "picked",
+    or why not: "disabled", "elsewhere", "none", "no button", "error: ..."."""
+    global _picker_misses
+    if not open_go_to_date(page):
+        return "no button"
+    try:
+        status = "none"
+        for _ in range(3):  # the month it opens on, then up to two "next month" pages
+            status = find_day(page, target)
+            if status == "found":
+                click_tagged(page)
+                return "picked"
+            if status == "input":
+                page.locator(PICK).first.fill(target.isoformat(), timeout=5000)
+                return "picked"
+            if status != "elsewhere" or not page.evaluate(NEXT_MONTH_JS):
+                break
+            click_tagged(page)
+        if status == "none":
+            _picker_misses += 1
+        return status
+    except Exception as e:
+        return f"error: {e}"
+    finally:
+        close_picker(page)
+
+
+def step_to_date(page, target):
+    """One arrow click per day until the title reads `target`, or LibCal says
+    the bookable window has ended. The old way; now only a fallback."""
+    shown = shown_date(page)
+    for _ in range(abs((target - shown).days) + 2 if shown else 0):
+        shown = shown_date(page)
+        if shown is None or shown == target or end_notice_visible(page):
+            break
+        arrow = page.locator("button.fc-next-button" if shown < target
+                             else "button.fc-prev-button")
+        if count_safe(arrow) == 0 or not arrow.first.is_enabled():
+            break
+        arrow.first.click()
+        wait_for_grid(page)
+    return shown_date(page) == target
+
+
+def go_to_date(page, target):
+    """Put `target` on the grid with Go To Date (pic2) rather than one
+    next-arrow click per day. True once the title shows `target`."""
+    if shown_date(page) == target:
+        return True
+    status = pick_date(page, target) if _picker_misses < 2 else "skipped"
+    if status == "picked":
+        if wait_for_shown_date(page, target):
+            wait_for_grid(page)
+            log(f"  Go To Date -> {_day(target)}")
+            return True
+        status = "clicked, but the grid didn't move"
+    if status == "disabled":
+        # Greyed out in the calendar: almost always the first day past the
+        # bookable window. Jump to the day before; the one arrow click below
+        # then brings up LibCal's end-of-window notice, as stepping always did.
+        before = target - timedelta(days=1)
+        if before != shown_date(page) and pick_date(page, before) == "picked":
+            if wait_for_shown_date(page, before):
+                wait_for_grid(page)
+    else:
+        log(f"  Go To Date didn't reach {_day(target)} ({status}); using the arrows")
+    return step_to_date(page, target)
 
 
 # ---------- login ----------
@@ -378,6 +619,15 @@ PW_SEL = "input[type=password], input[name=passwd]"
 EMAIL_SEL = "input[type=email], input[name=loginfmt]"
 
 
+def on_booking_site(page):
+    """True once the browser is back on LibCal itself. Compares hosts, since
+    an SSO page's query string can carry the LibCal address it returns to."""
+    try:
+        return urlparse(page.url).hostname == urlparse(URL).hostname
+    except Exception:
+        return False
+
+
 def login(page, netid, password):
     """Returns 'ok', 'no_login_page', 'bad_credentials', 'duo_no_prompt', 'duo_timeout'."""
     email = page.locator(EMAIL_SEL).first
@@ -406,6 +656,9 @@ def login(page, netid, password):
     deadline = time.time() + 25
     duo_clicked = False
     while time.time() < deadline:
+        if on_booking_site(page):
+            log("  login complete (no Duo prompt)")
+            return "ok"
         if login_error_visible(page):
             return "bad_credentials"
         if click_named_wait(page, "Approve with MFA (Duo)", timeout=800):
@@ -419,7 +672,7 @@ def login(page, netid, password):
     log(f"  >>> Approve the Duo push on your phone ({DUO_WAIT_SECONDS}s) <<<")
     deadline = time.time() + DUO_WAIT_SECONDS
     while time.time() < deadline:
-        if "nyu.libcal.com" in page.url:
+        if on_booking_site(page):
             log("  login complete")
             return "ok"
         for yes in [
@@ -545,7 +798,13 @@ def save_confirmation(page, room, date_iso):
 # ---------- per-credential (per-day) run ----------
 def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
                        sections=SECTIONS, max_days=MAX_DAYS, result=None,
-                       on_login_done=None):
+                       on_login_done=None, before_day=None, after_day=None):
+    """Book `room` one day at a time for up to `max_days` days.
+
+    before_day(offset) runs before a day is looked at and may block;
+    after_day(offset) runs once that day's booking is settled. parallel_bot
+    uses them so credentials booking the same room take turns per day.
+    """
     page.on("dialog", lambda d: d.accept())  # auto-accept "Leave site?" (pic3)
 
     # result is filled in place so partial progress survives even if a later
@@ -553,12 +812,14 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
     if result is None:
         result = {"idx": idx, "netid": netid, "name": name, "room": room,
                   "days": [], "login_failed": False}
-    page.goto(URL, wait_until="domcontentloaded")
 
     first_login_done = False
+    start_date = None  # the day the grid opens on, i.e. offset 0
     offset = 0
     while offset < max_days:
         try:
+            if before_day:
+                before_day(offset)
             # Start every day from a freshly loaded search page. After
             # "Make Another Booking"/"Remove" the previous day leaves residual
             # cart and filter state behind, and ensure_search_form only reloads
@@ -568,7 +829,17 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
             page.goto(URL, wait_until="domcontentloaded")
             ensure_search_form(page)
             show_availability(page)
-            advance_to_offset(page, offset)
+            if start_date is None:
+                start_date = shown_date(page)
+            if start_date is None:
+                advance_to_offset(page, offset)  # title unreadable: step blind
+            else:
+                target = start_date + timedelta(days=offset)
+                if not go_to_date(page, target) and not end_notice_visible(page):
+                    human = f"{target:%A, %B} {target.day}, {target.year}"
+                    log(f"{human}: could not get to this date")
+                    result["days"].append((human, "error (could not reach date)"))
+                    continue
             page.wait_for_timeout(1000)  # extra load buffer for green cells
 
             if end_notice_visible(page):
@@ -610,6 +881,8 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
                 continue
 
             outcome, errtext = submit_and_classify(page)
+            if after_day:
+                after_day(offset)  # settled either way; don't wait on the screenshot
             if outcome == "confirmed":
                 save_confirmation(page, room, date_iso)
                 log(f"{date_human}: booked")
@@ -628,6 +901,8 @@ def run_for_credential(page, netid, password, name, idx, room=ROOM_TO_BOOK,
             log(f"day offset {offset}: recovered from error -- {e}")
             result["days"].append((f"offset {offset}", f"error: {e}"))
         finally:
+            if after_day:
+                after_day(offset)
             offset += 1
 
     return result
@@ -644,7 +919,7 @@ def click_begin_booking_request(page):
 # ---------- runner ----------
 def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BOOK,
                        sections=SECTIONS, max_days=MAX_DAYS, headless=False,
-                       on_login_done=None):
+                       on_login_done=None, before_day=None, after_day=None):
     global _LOG_TAG
     _LOG_TAG = f"[{name}] "
     print(f"\n===== {name}: booking {room} for {netid}, one day at a time =====", flush=True)
@@ -666,6 +941,17 @@ def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BO
         except Exception as e:
             log(f"  on_login_done callback failed: {e}")
 
+    def guarded(hook):
+        if hook is None:
+            return None
+
+        def call(offset):
+            try:
+                hook(offset)
+            except Exception as e:
+                log(f"  {hook.__name__} callback failed: {e}")
+        return call
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=150)
         context = browser.new_context(viewport={"width": 1400, "height": 900})
@@ -675,7 +961,9 @@ def run_one_credential(netid, password, name, idx=1, total=None, room=ROOM_TO_BO
             # already recorded are kept even if it raises before returning.
             run_for_credential(page, netid, password, name, idx, room,
                                sections, max_days, result=result,
-                               on_login_done=fire_login_done)
+                               on_login_done=fire_login_done,
+                               before_day=guarded(before_day),
+                               after_day=guarded(after_day))
         except Exception as e:
             log(f"ERROR: {e}")
             result["error"] = str(e)
@@ -697,6 +985,8 @@ def print_summary(results):
             print(f"{date_human}: {status}", flush=True)
         if r.get("login_failed"):
             print("(stopped early: login failed)", flush=True)
+        if r.get("error"):
+            print(f"(stopped early: {r['error']})", flush=True)
         if not r.get("days"):
             print("(no dates processed)", flush=True)
 

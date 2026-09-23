@@ -41,8 +41,8 @@ git-ignored so your password and cookies never get committed.
 
 | Script | What it does |
 | --- | --- |
-| `booking_bot.py` | Browser bot. Books one room across the ~14-day window, one day at a time (avoids LibCal's 180-min/day cart limit). You approve the Duo push once. |
-| `parallel_bot.py` | Runs `booking_bot` for several credentials, each in its own process. Logins are handed off one at a time: the next credential starts its Duo push only once the previous one resolves, so they all end up booking at once without overlapping pushes. |
+| `booking_bot.py` | Browser bot. Books one room across the ~14-day window, one day at a time (avoids LibCal's 180-min/day cart limit), jumping to each date with **Go To Date**. You approve the Duo push once. |
+| `parallel_bot.py` | Stacks `booking_bot` runs for several credentials, each in its own process. The next credential starts only once the previous one's SSO login has passed or failed, so only one Duo push is ever pending, and they all end up booking at once. |
 | `capture_requests.py` | Records the real API calls LibCal fires during one manual booking, so they can be replayed without a browser. Also saves your login cookie to `state.json`. |
 | `http_booking.py` | Talks to those endpoints directly with the saved cookie — seconds instead of minutes, no browser. |
 
@@ -65,15 +65,23 @@ all you need for the common case. Extra flags tune the run without editing code:
 | `--sections N` | ✓ | ✓ | click groups per day, ~1 hr each (default 3) |
 | `--max-days N` | ✓ | ✓ | safety cap on days to walk (default 20) |
 | `--headless` | ✓ | | no visible window (only with a saved session; Duo needs a window) |
-| `--login-timeout N` | | ✓ | seconds to wait on the previous credential's Duo before starting anyway (default 300) |
+| `--login-timeout N` | | ✓ | start the next credential after N seconds even if the previous SSO login hasn't passed or failed (default: wait until it has) |
 
 A browser window opens; watch your phone for the Duo push and approve it.
 Confirmation screenshots land in `confirmations/`.
 
+Each date is reached through the **Go To Date** calendar, so every day costs the
+same couple of clicks instead of one next-arrow click per day ahead. If that
+calendar ever can't be used, the bot says so in the log and falls back to the
+arrows.
+
 With `parallel_bot.py` you get one window per credential, but only one Duo push
 at a time: approve (or deny) the first, and the next credential logs in while
 the first carries on booking. Every credential is running by the time the last
-push is answered.
+push is answered. Since they all book the same room, they also take turns per
+day: a credential only loads a date once the credentials ahead of it have
+finished booking it. Otherwise two of them would pick the same free slots and
+the second would lose that day.
 
 ### The faster HTTP path (opt-in, needs a one-time capture)
 
